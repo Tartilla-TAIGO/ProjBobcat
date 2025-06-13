@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
+using ProjBobcat.Class.Helper;
 using ProjBobcat.Class.Helper.Download;
 using ProjBobcat.Class.Model;
 using ProjBobcat.Class.Model.Downloading;
@@ -59,6 +60,7 @@ public class DefaultResourceCompleter : IResourceCompleter
         Interlocked.Exchange(ref this._needToDownload, 0);
         Interlocked.Exchange(ref this._totalDownloaded, 0);
         this._failedFiles.Clear();
+        var downloadBag = new ConcurrentBag<MultiSourceDownloadFile>();
 
         var numBatches = Math.Min(MaxDegreeOfParallelism, Environment.ProcessorCount);
         var downloadSettings = new DownloadSettings
@@ -76,21 +78,55 @@ public class DefaultResourceCompleter : IResourceCompleter
             Progress = ProgressValue.Start,
             Status = "正在进行资源检查"
         });
-
-        var linkOption = new DataflowLinkOptions { PropagateCompletion = true };
-        var downloadBlock = DownloadHelper.BuildAdvancedDownloadTplBlock(downloadSettings);
-        var checkBlock = new TransformManyBlock<CheckFileInfo, AbstractDownloadBase>(TransformCheckFiles, new ExecutionDataflowBlockOptions
+        var checkAction = new ActionBlock<IResourceInfoResolver>(async resolver =>
         {
-            MaxDegreeOfParallelism = numBatches
+            resolver.GameResourceInfoResolveEvent += FireResolveEvent;
+
+            await Parallel.ForEachAsync(
+                resolver.ResolveResourceAsync(basePath, checkLocalFiles, resolvedGame),
+                new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism },
+                ReceiveGameResourceTask);
+
+            return;
+
+            void FireResolveEvent(object? sender, GameResourceInfoResolveEventArgs e)
+            {
+                if (!downloadBag.IsEmpty)
+                {
+                    resolver.GameResourceInfoResolveEvent -= FireResolveEvent;
+                    return;
+                }
+
+                OnResolveComplete(sender, e);
+            }
+        }, new ExecutionDataflowBlockOptions
+        {
+            BoundedCapacity = MaxDegreeOfParallelism,
+            MaxDegreeOfParallelism = MaxDegreeOfParallelism
         });
 
-        checkBlock.LinkTo(downloadBlock, linkOption);
+        foreach (var r in ResourceInfoResolvers!)
+            await checkAction.SendAsync(r);
 
-        foreach (var r in this.ResourceInfoResolvers!)
-            await checkBlock.SendAsync(new CheckFileInfo(r, basePath, checkLocalFiles, resolvedGame));
+        checkAction.Complete();
+        await checkAction.Completion;
 
-        checkBlock.Complete();
-        await downloadBlock.Completion;
+        OnResolveComplete(this, new GameResourceInfoResolveEventArgs
+        {
+            Progress = new ProgressValue(1),
+            Status = "资源检查完成"
+        });
+
+        if (downloadBag.IsEmpty)
+            return new TaskResult<ResourceCompleterCheckResult?>(
+                TaskResultStatus.Success,
+                value: new ResourceCompleterCheckResult { FailedFiles = [], IsLibDownloadFailed = false });
+
+        var downloads = downloadBag.ToArray();
+
+        Random.Shared.Shuffle(downloads);
+
+        await DownloadHelper.AdvancedDownloadListFile(downloads, downloadSettings);
 
         this.OnResolveComplete(this, new GameResourceInfoResolveEventArgs
         {
@@ -113,6 +149,31 @@ public class DefaultResourceCompleter : IResourceCompleter
         };
 
         return new TaskResult<ResourceCompleterCheckResult?>(result, value: resultArgs);
+        ValueTask ReceiveGameResourceTask(IGameResource element, CancellationToken ct)
+        {
+            OnResolveComplete(this, new GameResourceInfoResolveEventArgs
+            {
+                Progress = new ProgressValue(0),
+                Status = $"发现未下载的 {element.FileName.CropStr()}({element.Type})，已加入下载队列"
+            });
+
+            var dF = new MultiSourceDownloadFile
+            {
+                DownloadPath = element.Path,
+                DownloadUris = element.Urls,
+                FileName = element.FileName,
+                FileSize = element.FileSize,
+                CheckSum = element.CheckSum,
+                FileType = element.Type
+            };
+            dF.Completed += WhenCompleted;
+
+            downloadBag.Add(dF);
+
+            Interlocked.Add(ref _needToDownload, 1);
+
+            return default;
+        }
     }
 
     async IAsyncEnumerable<AbstractDownloadBase> TransformCheckFiles(CheckFileInfo arg)
